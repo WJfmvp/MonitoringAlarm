@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,7 +23,6 @@ import (
 
 // 定义Prometheus指标
 var (
-	// 按namespace和失败类型统计失败Pod当前数量
 	imagePullFailureGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "k8s_pod_image_pull_failure_total",
@@ -30,7 +30,6 @@ var (
 		},
 		[]string{"namespace", "reason"},
 	)
-	// 按namespace和失败类型统计告警事件发生次数
 	imagePullFailureAlertCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "k8s_pod_image_pull_failure_alerts_total",
@@ -38,14 +37,20 @@ var (
 		},
 		[]string{"namespace", "reason"},
 	)
-	// 本地缓存告警次数用于日志
-	alertCounts = sync.Map{} // key: "namespace/reason", value: int
 )
 
-// podFailures 用于跟踪当前所有失败Pod的状态, key: namespace/pod, value: map[reason]struct{}
-var (
-	podFailures sync.Map
-)
+// podInfo 包含失败原因及锁
+type podInfo struct {
+	mu      sync.Mutex
+	reasons map[string]struct{}
+}
+
+type alertCount struct {
+	count atomic.Int64
+}
+
+var podFailures sync.Map
+var alertCounts sync.Map
 
 // 为不同失败原因预定义正则表达式，用于根据错误信息做归类
 var (
@@ -55,65 +60,59 @@ var (
 	reTLS           = regexp.MustCompile(`(?i)tls handshake`)
 )
 
-// onPodAddOrUpdate 处理Pod新建/更新事件
 func onPodAddOrUpdate(obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return
 	}
 
-	// 日志打印
 	log.Printf("Pod handler triggered for %s/%s; phase=%s, containers=%d",
 		pod.Namespace, pod.Name, pod.Status.Phase, len(pod.Status.ContainerStatuses))
 
-	// 计算当前Pod镜像拉取失败的所有原因
 	reasons := analyzePodImagePullErrors(pod)
-	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-
-	// 如果Phase为Pending且没有容器状态，统计sandbox失败
 	if pod.Status.Phase == corev1.PodPending && len(pod.Status.ContainerStatuses) == 0 {
 		reasons["sandbox_create_failure"] = struct{}{}
 	}
 
-	if len(reasons) > 0 {
-		log.Printf("Pod %s has image pull failure reasons: %v", key, reasons)
-	}
+	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+	piVal, _ := podFailures.LoadOrStore(key, &podInfo{reasons: make(map[string]struct{})})
+	pi := piVal.(*podInfo)
 
-	// 获取旧的原因集合
-	oldVal, _ := podFailures.LoadOrStore(key, make(map[string]struct{}))
-	oldReasons := oldVal.(map[string]struct{})
+	pi.mu.Lock()
+	defer pi.mu.Unlock()
 
-	// 删除旧的不再存在的原因
-	for r := range oldReasons {
+	updateReasons(pi, reasons, pod)
+}
+
+func updateReasons(pi *podInfo, reasons map[string]struct{}, pod *corev1.Pod) {
+	// 删除旧的原因
+	for r := range pi.reasons {
 		if _, found := reasons[r]; !found {
 			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Dec()
-			delete(oldReasons, r)
+			delete(pi.reasons, r)
 		}
 	}
 
-	// 添加新的原因，同时触发告警计数并记录日志
+	// 添加新的原因
 	for r := range reasons {
-		if _, found := oldReasons[r]; !found {
+		if _, found := pi.reasons[r]; !found {
 			// 更新Gauge
 			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Inc()
 			// 更新Counter
 			imagePullFailureAlertCounter.WithLabelValues(pod.Namespace, r).Inc()
+
 			// 本地缓存累加并日志输出
 			countKey := fmt.Sprintf("%s/%s", pod.Namespace, r)
-			val, _ := alertCounts.LoadOrStore(countKey, 0)
-			newCount := val.(int) + 1
-			alertCounts.Store(countKey, newCount)
+			acVal, _ := alertCounts.LoadOrStore(countKey, &alertCount{})
+			ac := acVal.(*alertCount)
+			newCount := ac.count.Add(1)
 			log.Printf("Alert #%d for image pull failure in %s reason=%s", newCount, pod.Namespace, r)
 
-			oldReasons[r] = struct{}{}
+			pi.reasons[r] = struct{}{}
 		}
 	}
-
-	// 存储更新后的原因集合
-	podFailures.Store(key, oldReasons)
 }
 
-// onPodDelete 处理Pod删除事件，清理Gauge指标
 func onPodDelete(obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -130,14 +129,15 @@ func onPodDelete(obj interface{}) {
 	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	reasonsVal, loaded := podFailures.LoadAndDelete(key)
 	if loaded {
-		reasons := reasonsVal.(map[string]struct{})
-		for r := range reasons {
+		pi := reasonsVal.(*podInfo)
+		pi.mu.Lock()
+		defer pi.mu.Unlock()
+		for r := range pi.reasons {
 			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Dec()
 		}
 	}
 }
 
-// analyzePodImagePullErrors 分析Pod容器状态，返回所有失败原因
 func analyzePodImagePullErrors(pod *corev1.Pod) map[string]struct{} {
 	reasons := make(map[string]struct{})
 	checkContainerStatuses := func(statuses []corev1.ContainerStatus) {
@@ -158,7 +158,6 @@ func analyzePodImagePullErrors(pod *corev1.Pod) map[string]struct{} {
 	return reasons
 }
 
-// isImagePullFailureReason 判断是否为镜像拉取失败相关reason
 func isImagePullFailureReason(reason string) bool {
 	switch reason {
 	case "ErrImagePull", "ImagePullBackOff", "Cancelled", "RegistryUnavailable":
@@ -168,7 +167,6 @@ func isImagePullFailureReason(reason string) bool {
 	}
 }
 
-// classifyFailureReason 根据reason和message分类失败类型
 func classifyFailureReason(reason, message string) string {
 	base := strings.ToLower(reason)
 	switch base {
@@ -197,24 +195,16 @@ func main() {
 	prometheus.MustRegister(imagePullFailureGauge)
 	prometheus.MustRegister(imagePullFailureAlertCounter)
 
-	//// 创建k8s客户端配置（集群内部使用）
+	// 创建k8s客户端配置（集群内部使用）
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatalf("Error creating in cluster config: %v", err)
 	}
 
-	// 创建k8s客户端配置，使用本地的Kubeconfig文件
-	//config, err := clientcmd.BuildConfigFromFlags("", "/Users/wj/kube/local-test")
-	//if err != nil {
-	//	log.Fatalf("Error loading kubeconfig: %v", err)
-	//}
-
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Error creating Kubernetes clientset: %v", err)
 	}
-
-	//imagePullFailureGauge.WithLabelValues("debug-ns", "debug-reason").Set(0)
 
 	// 创建SharedInformerFactory，监听所有命名空间的Pod事件
 	factory := informers.NewSharedInformerFactory(clientset, 0)
