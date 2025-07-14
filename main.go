@@ -82,7 +82,7 @@ func onPodAddOrUpdate(obj interface{}) {
 	if !ok {
 		return
 	}
-	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+	podKey := fmt.Sprintf("%s/%s", pod.Namespace)
 	log.Printf("[PodEvent] %s phase=%s uid=%s containers=%d", podKey, pod.Status.Phase, string(pod.UID), len(pod.Status.ContainerStatuses))
 
 	checkSlowPull := func(ns, podName, uid string, cs corev1.ContainerStatus, image string) {
@@ -168,6 +168,12 @@ func onPodDelete(obj interface{}) {
 		defer pi.mu.Unlock()
 		for r := range pi.reasons {
 			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Dec()
+		}
+	}
+
+	if val, exists := slowPullTimers.LoadAndDelete(key); exists {
+		if t, ok := val.(*time.Timer); ok {
+			t.Stop()
 		}
 	}
 }
