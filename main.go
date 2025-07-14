@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"k8s.io/client-go/rest"
 	"log"
@@ -12,10 +14,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -37,6 +41,13 @@ var (
 		},
 		[]string{"namespace", "reason"},
 	)
+	imagePullSlowAlertCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8s_pod_image_pull_slow_alerts_total",
+			Help: "Total number of image pull slow alerts triggered (>=5m), by namespace and registry",
+		},
+		[]string{"namespace", "registry"},
+	)
 )
 
 // podInfo 包含失败原因及锁
@@ -49,8 +60,14 @@ type alertCount struct {
 	count atomic.Int64
 }
 
-var podFailures sync.Map
-var alertCounts sync.Map
+// slowPullTimers 存储 image pull 定时器
+var slowPullTimers sync.Map // key:string -> *time.Timer
+
+var (
+	podFailures sync.Map // key namespace/pod -> *podInfo
+	alertCounts sync.Map // key namespace/reason -> *alertCount
+	clientset   *kubernetes.Clientset
+)
 
 // 为不同失败原因预定义正则表达式，用于根据错误信息做归类
 var (
@@ -65,17 +82,61 @@ func onPodAddOrUpdate(obj interface{}) {
 	if !ok {
 		return
 	}
+	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+	log.Printf("[PodEvent] %s phase=%s uid=%s containers=%d", podKey, pod.Status.Phase, string(pod.UID), len(pod.Status.ContainerStatuses))
 
-	log.Printf("Pod handler triggered for %s/%s; phase=%s, containers=%d",
-		pod.Namespace, pod.Name, pod.Status.Phase, len(pod.Status.ContainerStatuses))
+	checkSlowPull := func(ns, podName, uid string, cs corev1.ContainerStatus, image string) {
+		key := fmt.Sprintf("%s/%s/%s", ns, podName, cs.Name)
+
+		if cs.ContainerID == "" && cs.State.Waiting != nil && isPublicRegistry(image) {
+			// 使用 time.AfterFunc 启动定时器
+			timer := time.AfterFunc(5*time.Minute, func() {
+				// 5 分钟后再核实一次状态
+				p2, err := clientset.CoreV1().Pods(ns).Get(context.Background(), podName, metav1.GetOptions{})
+				if err != nil {
+					log.Printf("[SlowPull] 获取 Pod %s/%s 失败: %v", ns, podName, err)
+					return
+				}
+				for _, newCs := range p2.Status.ContainerStatuses {
+					if newCs.Name == cs.Name && newCs.ContainerID == "" {
+						registry := parseRegistry(image)
+						imagePullSlowAlertCounter.WithLabelValues(ns, registry).Inc()
+						log.Printf("[SlowPullAlert] %s/%s container=%s registry=%s", ns, podName, cs.Name, registry)
+					}
+				}
+				slowPullTimers.Delete(key)
+			})
+
+			actual, loaded := slowPullTimers.LoadOrStore(key, timer)
+			if loaded {
+				// 已有定时器在跑，停止新创建的
+				timer.Stop()
+				_ = actual
+			}
+		} else {
+			// 拉取成功或状态变化，取消并删除定时器
+			if val, exists := slowPullTimers.LoadAndDelete(key); exists {
+				if t, ok := val.(*time.Timer); ok {
+					t.Stop()
+				}
+			}
+		}
+	}
+
+	// 遍历 InitContainerStatuses + ContainerStatuses
+	for _, cs := range pod.Status.InitContainerStatuses {
+		checkSlowPull(pod.Namespace, pod.Name, string(pod.UID), cs, cs.Image)
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		checkSlowPull(pod.Namespace, pod.Name, string(pod.UID), cs, cs.Image)
+	}
 
 	reasons := analyzePodImagePullErrors(pod)
 	if pod.Status.Phase == corev1.PodPending && len(pod.Status.ContainerStatuses) == 0 {
 		reasons["sandbox_create_failure"] = struct{}{}
 	}
 
-	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-	piVal, _ := podFailures.LoadOrStore(key, &podInfo{reasons: make(map[string]struct{})})
+	piVal, _ := podFailures.LoadOrStore(podKey, &podInfo{reasons: make(map[string]struct{})})
 	pi := piVal.(*podInfo)
 
 	pi.mu.Lock()
@@ -84,44 +145,17 @@ func onPodAddOrUpdate(obj interface{}) {
 	updateReasons(pi, reasons, pod)
 }
 
-func updateReasons(pi *podInfo, reasons map[string]struct{}, pod *corev1.Pod) {
-	// 删除旧的原因
-	for r := range pi.reasons {
-		if _, found := reasons[r]; !found {
-			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Dec()
-			delete(pi.reasons, r)
-		}
-	}
-
-	// 添加新的原因
-	for r := range reasons {
-		if _, found := pi.reasons[r]; !found {
-			// 更新Gauge
-			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Inc()
-			// 更新Counter
-			imagePullFailureAlertCounter.WithLabelValues(pod.Namespace, r).Inc()
-
-			// 本地缓存累加并日志输出
-			countKey := fmt.Sprintf("%s/%s", pod.Namespace, r)
-			acVal, _ := alertCounts.LoadOrStore(countKey, &alertCount{})
-			ac := acVal.(*alertCount)
-			newCount := ac.count.Add(1)
-			log.Printf("Alert #%d for image pull failure in %s reason=%s", newCount, pod.Namespace, r)
-
-			pi.reasons[r] = struct{}{}
-		}
-	}
-}
-
 func onPodDelete(obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
+			log.Printf("[onPodDelete] 无法解析已删除对象类型: %T", obj)
 			return
 		}
 		pod, ok = tombstone.Obj.(*corev1.Pod)
 		if !ok {
+			log.Printf("[onPodDelete] Tombstone 对象无法转换: %T", tombstone.Obj)
 			return
 		}
 	}
@@ -142,13 +176,9 @@ func analyzePodImagePullErrors(pod *corev1.Pod) map[string]struct{} {
 	reasons := make(map[string]struct{})
 	checkContainerStatuses := func(statuses []corev1.ContainerStatus) {
 		for _, cs := range statuses {
-			if cs.State.Waiting != nil {
-				reason := cs.State.Waiting.Reason
-				msg := cs.State.Waiting.Message
-				if isImagePullFailureReason(reason) {
-					classified := classifyFailureReason(reason, msg)
-					reasons[classified] = struct{}{}
-				}
+			if cs.State.Waiting != nil && isImagePullFailureReason(cs.State.Waiting.Reason) {
+				classified := classifyFailureReason(cs.State.Waiting.Reason, cs.State.Waiting.Message)
+				reasons[classified] = struct{}{}
 			}
 		}
 	}
@@ -156,6 +186,23 @@ func analyzePodImagePullErrors(pod *corev1.Pod) map[string]struct{} {
 	checkContainerStatuses(pod.Status.InitContainerStatuses)
 	checkContainerStatuses(pod.Status.ContainerStatuses)
 	return reasons
+}
+
+func isPublicRegistry(image string) bool {
+	return strings.HasPrefix(image, "docker.io/") ||
+		strings.HasPrefix(image, "gcr.io/") ||
+		strings.HasPrefix(image, "ghcr.io/") ||
+		strings.HasPrefix(image, "k8s.gcr.io/") ||
+		strings.HasPrefix(image, "quay.io/") ||
+		strings.HasPrefix(image, "registry.k8s.io/")
+}
+
+func parseRegistry(image string) string {
+	parts := strings.Split(image, "/")
+	if len(parts) > 1 && strings.Contains(parts[0], ".") {
+		return parts[0]
+	}
+	return "docker.io"
 }
 
 func isImagePullFailureReason(reason string) bool {
@@ -168,78 +215,110 @@ func isImagePullFailureReason(reason string) bool {
 }
 
 func classifyFailureReason(reason, message string) string {
-	base := strings.ToLower(reason)
-	switch base {
+	lowMsg := strings.ToLower(message)
+	switch strings.ToLower(reason) {
 	case "errimagepull", "imagepullbackoff":
-		low := strings.ToLower(message)
-		switch {
-		case reImageNotFound.MatchString(low):
+		if reImageNotFound.MatchString(lowMsg) {
 			return "image_not_found"
-		case reProxyError.MatchString(low):
-			return "proxy_error"
-		case reUnauthorized.MatchString(low):
-			return "unauthorized"
-		case reTLS.MatchString(low):
-			return "tls_handshake_error"
-		default:
-			log.Printf("Classify default for %s: %s", reason, message)
-			return "unknown_error"
 		}
+		if reProxyError.MatchString(lowMsg) {
+			return "proxy_error"
+		}
+		if reUnauthorized.MatchString(lowMsg) {
+			return "unauthorized"
+		}
+		if reTLS.MatchString(lowMsg) {
+			return "tls_handshake_error"
+		}
+		// 其他情况
+		log.Printf("[Classify] 未知错误分类 reason=%s message=%s", reason, message)
+		return "unknown_error"
 	default:
-		return base
+		return strings.ToLower(reason)
+	}
+}
+
+func updateReasons(pi *podInfo, reasons map[string]struct{}, pod *corev1.Pod) {
+	// 删除旧的原因
+	for r := range pi.reasons {
+		if _, found := reasons[r]; !found {
+			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Dec()
+			delete(pi.reasons, r)
+		}
+	}
+
+	// 添加新的原因
+	for r := range reasons {
+		if _, found := pi.reasons[r]; !found {
+			imagePullFailureGauge.WithLabelValues(pod.Namespace, r).Inc()
+			imagePullFailureAlertCounter.WithLabelValues(pod.Namespace, r).Inc()
+
+			countKey := fmt.Sprintf("%s/%s", pod.Namespace, r)
+			acVal, _ := alertCounts.LoadOrStore(countKey, &alertCount{})
+			ac := acVal.(*alertCount)
+			newCount := ac.count.Add(1)
+			log.Printf("[AlertCounter] #%d %s namespace=%s reason=%s", newCount, pod.Name, pod.Namespace, r)
+
+			pi.reasons[r] = struct{}{}
+		}
 	}
 }
 
 func main() {
-	// 注册Prometheus指标
+	// 注册 Prometheus 指标
 	prometheus.MustRegister(imagePullFailureGauge)
 	prometheus.MustRegister(imagePullFailureAlertCounter)
+	prometheus.MustRegister(imagePullSlowAlertCounter)
 
-	// 创建k8s客户端配置（集群内部使用）
+	// 创建 in-cluster 配置
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Fatalf("Error creating in cluster config: %v", err)
+		log.Fatalf("Error creating in-cluster config: %v", err)
 	}
-
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Error creating Kubernetes clientset: %v", err)
 	}
 
-	// 创建SharedInformerFactory，监听所有命名空间的Pod事件
+	// 创建 informer
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 	podInformer := factory.Core().V1().Pods().Informer()
-
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    onPodAddOrUpdate,
-		UpdateFunc: func(oldObj, newObj interface{}) { onPodAddOrUpdate(newObj) },
+		UpdateFunc: func(old, new interface{}) { onPodAddOrUpdate(new) },
 		DeleteFunc: onPodDelete,
 	})
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// 启动Informer
-	go podInformer.Run(stopCh)
-
-	// 等待缓存同步
-	if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced) {
+	go podInformer.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced) {
 		log.Fatalf("Timed out waiting for caches to sync")
 	}
 
-	// 启动HTTP服务器，暴露metrics接口
-	http.Handle("/metrics", promhttp.Handler())
-
+	// HTTP server 和优雅停机
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: promhttp.Handler(),
+	}
 	go func() {
 		log.Println("Starting metrics server at :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Fatalf("Error starting HTTP server: %v", err)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Metrics server error: %v", err)
 		}
 	}()
 
-	// 优雅退出
+	// 捕获信号
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	log.Println("Shutdown signal received, exiting...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Error during server shutdown: %v", err)
+	}
+	log.Println("Server gracefully stopped")
 }
