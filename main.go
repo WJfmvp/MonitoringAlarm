@@ -171,11 +171,17 @@ func onPodDelete(obj interface{}) {
 		}
 	}
 
-	if val, exists := slowPullTimers.LoadAndDelete(key); exists {
-		if t, ok := val.(*time.Timer); ok {
-			t.Stop()
+	prefix := key + "/"
+	slowPullTimers.Range(func(k, v interface{}) bool {
+		sk := k.(string)
+		if strings.HasPrefix(sk, prefix) {
+			if t, ok := v.(*time.Timer); ok {
+				t.Stop()
+			}
+			slowPullTimers.Delete(sk)
 		}
-	}
+		return true
+	})
 }
 
 func analyzePodImagePullErrors(pod *corev1.Pod) map[string]struct{} {
